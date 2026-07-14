@@ -1,0 +1,919 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+=========================================================================================
+ 📟 APEX N-WAY PIPELINE (TOPOLOGICAL VOCAL KNOT EDITION)
+=========================================================================================
+Detects repeating song segments, executes deterministic source separation (NMF), and
+generates 3D delay-coordinate trajectories ("vocal knots") over a 5-second window
+centered on every vocal intonation or phonetic anomaly.
+"""
+
+import os
+import wave
+import time
+import numpy as np
+import librosa
+
+# Force non-interactive backend for headless execution compatibility
+import matplotlib
+matplotlib.use('Agg') 
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from matplotlib.backends.backend_pdf import PdfPages
+
+from scipy.spatial.distance import cdist
+from scipy.ndimage import uniform_filter1d
+from scipy.io.wavfile import write as wav_write
+
+# --- 1. CONFIGURATION ---
+TARGET_SR = 22050
+NUM_HEADS = 3       
+TAU_MS = 10         
+MIN_MATCH_SEC = 20  
+MATCH_THRESH = 0.16 
+SILENCE_THRESH = 0.02 
+
+
+# --- 2. UNION-FIND (DISJOINT SET UNION) DATA STRUCTURE ---
+class UnionFind:
+    def __init__(self):
+        self.parent = {}
+    def find(self, i):
+        if i not in self.parent:
+            self.parent[i] = i
+        if self.parent[i] == i:
+            return i
+        self.parent[i] = self.find(self.parent[i])
+        return self.parent[i]
+    def union(self, i, j):
+        root_i = self.find(i)
+        root_j = self.find(j)
+        if root_i != root_j:
+            self.parent[root_i] = root_j
+
+
+# --- 3. DUAL-GATE GLOBAL SEGMENT VERIFIER ---
+def verify_segment_similarity(y_a, y_b, sr=TARGET_SR):
+    if len(y_a) == 0 or len(y_b) == 0:
+        return False
+        
+    # Gate 1: Chord Alignment (Chroma STFT DTW)
+    chroma_a = librosa.feature.chroma_stft(y=y_a, sr=sr, hop_length=1024)
+    chroma_b = librosa.feature.chroma_stft(y=y_b, sr=sr, hop_length=1024)
+    
+    if chroma_a.shape[1] < 5 or chroma_b.shape[1] < 5:
+        return False
+        
+    dist_matrix_chroma = cdist(chroma_a.T, chroma_b.T, metric='cosine')
+    
+    from librosa.sequence import dtw
+    try:
+        step_sizes_sigma = np.array([[1, 1], [0, 1], [1, 0]])
+        weights_mul = np.array([1.0, 2.0, 2.0])
+        D_cost, wp = dtw(C=dist_matrix_chroma, step_sizes_sigma=step_sizes_sigma, weights_mul=weights_mul)
+        norm_cost_chroma = D_cost[-1, -1] / (len(wp) + 1e-9)
+    except Exception:
+        return False
+        
+    # Gate 2: Acoustic Fingerprint (Global Timbre MFCC Cosine Distance)
+    mfcc_a = librosa.feature.mfcc(y=y_a, sr=sr, n_mfcc=13, hop_length=1024)
+    mfcc_b = librosa.feature.mfcc(y=y_b, sr=sr, n_mfcc=13, hop_length=1024)
+    
+    mean_mfcc_a = np.mean(mfcc_a, axis=1)
+    mean_mfcc_b = np.mean(mfcc_b, axis=1)
+    timbral_dist = cdist(mean_mfcc_a[np.newaxis, :], mean_mfcc_b[np.newaxis, :], metric='cosine')[0, 0]
+    
+    return (norm_cost_chroma < 0.22) and (timbral_dist < 0.08)
+
+
+# --- 4. LONG-FORM CROSS-SIMILARITY SEARCH ---
+def search_longform_repeats(y_1, y_2, sr, min_sec=MIN_MATCH_SEC, thresh=MATCH_THRESH, is_self=False):
+    max_len = max(len(y_1), len(y_2))
+    if max_len > 10 * 60 * sr:    
+        hop = 16384
+    elif max_len > 3 * 60 * sr:   
+        hop = 8192
+    else:
+        hop = 4096
+        
+    chroma_1 = librosa.feature.chroma_stft(y=y_1, sr=sr, hop_length=hop)
+    chroma_2 = librosa.feature.chroma_stft(y=y_2, sr=sr, hop_length=hop)
+    
+    N1 = chroma_1.shape[1]
+    N2 = chroma_2.shape[1]
+    
+    rms_1 = np.zeros(N1)
+    rms_2 = np.zeros(N2)
+    for i in range(N1):
+        chunk = y_1[i*hop : (i+1)*hop]
+        if len(chunk) > 0:
+            rms_1[i] = np.sqrt(np.mean(chunk**2) + 1e-9)
+    for j in range(N2):
+        chunk = y_2[j*hop : (j+1)*hop]
+        if len(chunk) > 0:
+            rms_2[j] = np.sqrt(np.mean(chunk**2) + 1e-9)
+            
+    D = cdist(chroma_1.T, chroma_2.T, metric='cosine')
+    
+    for i in range(N1):
+        for j in range(N2):
+            if rms_1[i] < SILENCE_THRESH or rms_2[j] < SILENCE_THRESH:
+                D[i, j] = 1.0
+                
+    min_frames = int((min_sec * sr) / hop)
+    matches = []
+    
+    start_offset = min_frames if is_self else -N1 + min_frames
+    
+    for d in range(start_offset, N2 - min_frames):
+        diag = np.diagonal(D, offset=d)
+        smoothed = uniform_filter1d(diag, size=max(5, min_frames // 4))
+        under_thresh = smoothed < thresh
+        
+        run_start = None
+        for idx, val in enumerate(under_thresh):
+            if val and run_start is None:
+                run_start = idx
+            elif not val and run_start is not None:
+                run_len = idx - run_start
+                if run_len >= min_frames:
+                    if d >= 0:
+                        f1_start, f2_start = run_start, run_start + d
+                    else:
+                        f1_start, f2_start = run_start - d, run_start
+                        
+                    matches.append({
+                        'f1_start': f1_start,
+                        'f1_end': f1_start + run_len,
+                        'f2_start': f2_start,
+                        'f2_end': f2_start + run_len,
+                        'mean_dist': np.mean(diag[run_start:idx])
+                    })
+                run_start = None
+                
+        if run_start is not None:
+            run_len = len(under_thresh) - run_start
+            if run_len >= min_frames:
+                if d >= 0:
+                    f1_start, f2_start = run_start, run_start + d
+                else:
+                    f1_start, f2_start = run_start - d, run_start
+                matches.append({
+                    'f1_start': f1_start,
+                    'f1_end': f1_start + run_len,
+                    'f2_start': f2_start,
+                    'f2_end': f2_start + run_len,
+                    'mean_dist': np.mean(diag[run_start:])
+                })
+                
+    return matches, hop
+
+
+# --- 5. GRAPH CLUSTERING LAYER (EQUIVALENCE SET GROUPER) ---
+def cluster_and_group_segments(raw_matches, hop, sr):
+    canonical_segments = [] 
+    uf = UnionFind()
+    
+    def find_or_create_canonical(file_idx, start, end):
+        length = end - start
+        for seg in canonical_segments:
+            if seg['file_idx'] == file_idx:
+                overlap = max(0, min(end, seg['end']) - max(start, seg['start']))
+                if overlap > 0.4 * length or overlap > 0.4 * (seg['end'] - seg['start']):
+                    seg['start'] = min(seg['start'], start)
+                    seg['end'] = max(seg['end'], end)
+                    return seg['id']
+        new_id = len(canonical_segments)
+        canonical_segments.append({'id': new_id, 'file_idx': file_idx, 'start': start, 'end': end})
+        return new_id
+        
+    for m in raw_matches:
+        f1, s1, e1, f2, s2, e2, dist = m
+        id_1 = find_or_create_canonical(f1, s1, e1)
+        id_2 = find_or_create_canonical(f2, s2, e2)
+        uf.union(id_1, id_2)
+        
+    groups = {}
+    for seg in canonical_segments:
+        root = uf.find(seg['id'])
+        if root not in groups:
+            groups[root] = []
+        groups[root].append(seg)
+        
+    valid_groups = []
+    for root, segs in groups.items():
+        if len(segs) >= 2:
+            segs = sorted(segs, key=lambda x: (x['file_idx'], x['start']))
+            valid_groups.append(segs)
+            
+    return valid_groups
+
+
+# --- 6. DUAL-TRACK ALIGNMENT ENGINE (CONSTRAINT-TIGHTENED) ---
+def align_track_slices(y_a, y_b):
+    chroma_a = librosa.feature.chroma_stft(y=y_a, sr=TARGET_SR, hop_length=512)
+    chroma_b = librosa.feature.chroma_stft(y=y_b, sr=TARGET_SR, hop_length=512)
+    
+    dist_matrix = cdist(chroma_a.T, chroma_b.T, metric='cosine')
+    
+    from librosa.sequence import dtw
+    
+    step_sizes_sigma = np.array([[1, 1], [0, 1], [1, 0]])
+    weights_mul = np.array([1.0, 2.0, 2.0])
+    
+    _, wp = dtw(C=dist_matrix, step_sizes_sigma=step_sizes_sigma, weights_mul=weights_mul)
+    wp = wp[::-1]
+    
+    hop_size = 512
+    aligned_y_a, aligned_y_b = [], []
+    
+    for idx_a, idx_b in wp:
+        start_a, end_a = idx_a * hop_size, (idx_a + 1) * hop_size
+        start_b, end_b = idx_b * hop_size, (idx_b + 1) * hop_size
+        chunk_a = y_a[start_a:end_a]
+        chunk_b = y_b[start_b:end_b]
+        
+        min_len = min(len(chunk_a), len(chunk_b))
+        if min_len > 0:
+            aligned_y_a.extend(chunk_a[:min_len])
+            aligned_y_b.extend(chunk_b[:min_len])
+            
+    return np.array(aligned_y_a, dtype=np.float32), np.array(aligned_y_b, dtype=np.float32), wp, hop_size
+
+
+# --- 7. DETERMINISTIC PROJECTIVE MULTI-HEADED NMF ENGINE ---
+def process_projective_nmf(y_a, y_b, k=NUM_HEADS, max_iter=30):
+    stft_a = librosa.stft(y_a, n_fft=1024, hop_length=256)
+    stft_b = librosa.stft(y_b, n_fft=1024, hop_length=256)
+    
+    V_a = np.abs(stft_a) + 1e-9
+    V_b = np.abs(stft_b) + 1e-9
+    F, T = V_a.shape
+    
+    np.random.seed(42)
+    W = np.random.rand(F, k) + 1e-5
+    H_a = np.random.rand(k, T) + 1e-5
+    
+    for i in range(max_iter):
+        V_approx_a = W @ H_a + 1e-9
+        H_a = H_a * (W.T @ (V_a / V_approx_a)) / (W.T @ np.ones((F, T)) + 1e-9)
+        V_approx_a = W @ H_a + 1e-9
+        W = W * ((V_a / V_approx_a) @ H_a.T) / (np.ones((F, T)) @ H_a.T + 1e-9)
+        
+    np.random.seed(42)
+    H_b = np.random.rand(k, T) + 1e-5
+    for i in range(max_iter):
+        V_approx_b = W @ H_b + 1e-9
+        H_b = H_b * (W.T @ (V_b / V_approx_b)) / (W.T @ np.ones((F, T)) + 1e-9)
+        
+    freqs = np.linspace(0, TARGET_SR / 2, F)
+    centroids = []
+    for j in range(k):
+        centroid_j = np.sum(freqs * W[:, j]) / (np.sum(W[:, j]) + 1e-9)
+        centroids.append(centroid_j)
+        
+    sorted_indices = np.argsort(centroids)
+    labels_map = {}
+    if k == 3:
+        labels_map[sorted_indices[0]] = "Bass / Kick Resonance"
+        labels_map[sorted_indices[1]] = "Melodic Harmonics (Guitar/Keys/Vocals)"
+        labels_map[sorted_indices[2]] = "High Transients (Drums/Percussion)"
+    else:
+        for rank, idx in enumerate(sorted_indices):
+            labels_map[idx] = f"Source Cluster {rank} ({centroids[idx]:.0f}Hz)"
+            
+    sources_a, sources_b, head_names = [], [], []
+    
+    for j in range(k):
+        mask_a = (W[:, [j]] @ H_a[[j], :]) / (W @ H_a + 1e-9)
+        mask_b = (W[:, [j]] @ H_b[[j], :]) / (W @ H_b + 1e-9)
+        
+        sig_a = librosa.istft(stft_a * mask_a, hop_length=256)
+        sig_b = librosa.istft(stft_b * mask_b, hop_length=256)
+        
+        for list_sig, original_sig in [(sources_a, sig_a), (sources_b, sig_b)]:
+            sig_padded = original_sig
+            if len(sig_padded) < len(y_a):
+                sig_padded = np.pad(sig_padded, (0, len(y_a) - len(sig_padded)))
+            else:
+                sig_padded = sig_padded[:len(y_a)]
+            list_sig.append(sig_padded)
+            
+        head_names.append(labels_map[j])
+            
+    return sources_a, sources_b, head_names
+
+
+# --- 8. TOPOLOGICAL EMBEDDING HEADS ---
+class MultiHeadAgent:
+    def __init__(self, head_id, track_label, audio, sr, source_name):
+        self.id = head_id
+        self.source_name = source_name
+        self.label = f"{track_label} Head {head_id}"
+        self.audio = audio
+        
+        tau = int(sr * (TAU_MS / 1000.0))
+        self.x = audio[:-2*tau]
+        self.y_del = audio[tau:-tau]
+        self.z_del = audio[2*tau:]
+        
+        self.radius = np.sqrt(self.x**2 + self.y_del**2 + self.z_del**2) + 1e-8
+        
+        dx = np.gradient(self.x)
+        dy = np.gradient(self.y_del)
+        dz = np.gradient(self.z_del)
+        ddx = np.gradient(dx)
+        ddy = np.gradient(dy)
+        ddz = np.gradient(dz)
+        dddx = np.gradient(ddx)
+        dddy = np.gradient(ddy)
+        dddz = np.gradient(dz)
+        self.jerk = np.sqrt(dddx**2 + dddy**2 + dddz**2) + 1e-8
+
+
+# --- 9. FORENSIC SWEEP ENGINE (ALL-DISCREPANCY GENERATOR) ---
+def perform_deep_discrepancy_sweep(y_a, y_b, wp, dtw_hop, head_names, sources_a, sources_b, b_start, i_start):
+    anomalies = []
+    
+    # 1. TEMPO CHECK (Estimated Global BPM)
+    try:
+        tempo_a, _ = librosa.beat.beat_track(y=y_a, sr=TARGET_SR)
+        tempo_b, _ = librosa.beat.beat_track(y=y_b, sr=TARGET_SR)
+        
+        t_a = float(tempo_a[0]) if isinstance(tempo_a, np.ndarray) else float(tempo_a)
+        t_b = float(tempo_b[0]) if isinstance(tempo_b, np.ndarray) else float(tempo_b)
+        tempo_diff = t_b - t_a
+        
+        if np.abs(tempo_diff) > 0.1:
+            anomalies.append({
+                'time': 0.0,
+                'category': "Tempo Variance",
+                'severity': "🟡 MEDIUM",
+                'desc': f"Global Tempo Difference. Track A: {t_a:.1f} BPM, Track B: {t_b:.1f} BPM (Drift: {tempo_diff:+.1f} BPM)."
+            })
+    except Exception as e:
+        print(f"⚠️ [Sweep] Tempo tracking warning: {e}")
+
+    # 2. RHYTHMIC TIMING DRIFT
+    wp_array = np.array(wp)
+    time_a = wp_array[:, 0] * dtw_hop / TARGET_SR
+    time_b = wp_array[:, 1] * dtw_hop / TARGET_SR
+    offsets = time_b - time_a
+    smoothed_offsets = uniform_filter1d(offsets, size=int(TARGET_SR / dtw_hop * 2.0))
+    
+    peak_drift_idx = np.argmax(np.abs(smoothed_offsets))
+    peak_offset = smoothed_offsets[peak_drift_idx]
+    
+    if np.abs(peak_offset) > 0.04:
+        dir_label = "early" if peak_offset < 0 else "late"
+        anomalies.append({
+            'time': time_a[peak_drift_idx],
+            'category': "Rhythmic Timing",
+            'severity': "🔴 HIGH" if np.abs(peak_offset) > 0.50 else "🟡 MEDIUM",
+            'desc': f"Transient alignment offset detected: Track B is running {np.abs(peak_offset):.3f}s {dir_label}."
+        })
+
+    # 3. DYNAMIC COMPRESSION (Crest Factor)
+    crest_a = np.max(np.abs(y_a)) / (np.sqrt(np.mean(y_a**2)) + 1e-9)
+    crest_b = np.max(np.abs(y_b)) / (np.sqrt(np.mean(y_b**2)) + 1e-9)
+    db_diff = 20 * np.log10(crest_b / crest_a)
+    
+    if np.abs(db_diff) > 0.8:
+        action = "more compressed" if db_diff < 0 else "more dynamic"
+        anomalies.append({
+            'time': 0.0,
+            'category': "Dynamic Compression",
+            'severity': "🔵 INFO",
+            'desc': f"Track B is {np.abs(db_diff):.1f} dB {action} than Track A (mismatched mastering limiter thresholds)."
+        })
+
+    # 4. SPECTRAL EQUALIZATION (EQ)
+    spec_a = np.abs(librosa.stft(y_a, n_fft=1024))
+    spec_b = np.abs(librosa.stft(y_b, n_fft=1024))
+    mean_spec_a = np.mean(spec_a, axis=1)
+    mean_spec_b = np.mean(spec_b, axis=1)
+    
+    freqs = np.linspace(0, TARGET_SR/2, len(mean_spec_a))
+    
+    bass_ratio = np.mean(mean_spec_b[freqs < 150]) / (np.mean(mean_spec_a[freqs < 150]) + 1e-9)
+    mid_ratio = np.mean(mean_spec_b[(freqs >= 150) & (freqs < 4000)]) / (np.mean(mean_spec_a[(freqs >= 150) & (freqs < 4000)]) + 1e-9)
+    high_ratio = np.mean(mean_spec_b[freqs >= 4000]) / (np.mean(mean_spec_a[freqs >= 4000]) + 1e-9)
+    
+    for band_name, ratio in [("Bass (<150Hz)", bass_ratio), ("Midrange", mid_ratio), ("Treble (>4kHz)", high_ratio)]:
+        db_shift = 20 * np.log10(ratio)
+        if np.abs(db_shift) > 1.2:
+            direction = "boost" if db_shift > 0 else "cut"
+            anomalies.append({
+                'time': 0.0,
+                'category': "Spectral Balance",
+                'severity': "🔵 INFO",
+                'desc': f"EQ shift detected: {band_name} is altered by a {np.abs(db_shift):.1f} dB {direction} in Track B."
+            })
+
+    # 5. VOCAL MELODY / INTONATION CHECK
+    vocal_a = sources_a[1]
+    vocal_b = sources_b[1]
+    try:
+        f0_a = librosa.yin(y=vocal_a, sr=TARGET_SR, fmin=80, fmax=500, hop_length=512)
+        f0_b = librosa.yin(y=vocal_b, sr=TARGET_SR, fmin=80, fmax=500, hop_length=512)
+        v_rms_a = librosa.feature.rms(y=vocal_a, frame_length=1024, hop_length=512)[0]
+        v_rms_b = librosa.feature.rms(y=vocal_b, frame_length=1024, hop_length=512)[0]
+        
+        voiced_mask = (v_rms_a > 0.02) & (v_rms_b > 0.02) & (f0_a > 0) & (f0_b > 0)
+        if np.sum(voiced_mask) > 10:
+            pitch_corr = np.corrcoef(f0_a[voiced_mask], f0_b[voiced_mask])[0, 1]
+            anomalies.append({
+                'time': 0.0,
+                'category': "Melody Profile",
+                'severity': "🔵 INFO",
+                'desc': f"Overall Vocal Melodic Correlation across tracked frames is {pitch_corr*100:.1f}%."
+            })
+        
+        for i in range(min(len(f0_a), len(f0_b))):
+            if v_rms_a[i] > 0.02 and v_rms_b[i] > 0.02:
+                p_a, p_b = f0_a[i], f0_b[i]
+                if p_a > 0 and p_b > 0:
+                    diff_semi = 12 * np.log2(p_b / p_a)
+                    if 0.8 <= np.abs(diff_semi) < 5.0:
+                        intonation = "sharper" if diff_semi > 0 else "flatter"
+                        anomalies.append({
+                            'time': i * 512 / TARGET_SR,
+                            'category': "Vocal Intonation",
+                            'severity': "🟡 MEDIUM",
+                            'desc': f"Melodic pitch deviation: Vocalist is singing {np.abs(diff_semi):.2f} semitones {intonation}."
+                        })
+    except Exception as e:
+        print(f"⚠️ [Sweep] Melody tracking warning: {e}")
+
+    # 6. LYRICS / PHONETICS CHECK
+    try:
+        mfcc_a = librosa.feature.mfcc(y=vocal_a, sr=TARGET_SR, n_mfcc=13, hop_length=512)
+        mfcc_b = librosa.feature.mfcc(y=vocal_b, sr=TARGET_SR, n_mfcc=13, hop_length=512)
+        min_f = min(mfcc_a.shape[1], mfcc_b.shape[1])
+        
+        v_rms_a_frames = librosa.feature.rms(y=vocal_a, frame_length=1024, hop_length=512)[0][:min_f]
+        voiced_frames = v_rms_a_frames > 0.03
+        if np.sum(voiced_frames) > 5:
+            dists = [cdist(mfcc_a[:, [idx]].T, mfcc_b[:, [idx]].T, metric='cosine')[0, 0] for idx in range(min_f) if voiced_frames[idx]]
+            global_mismatch = np.mean(dists)
+            anomalies.append({
+                'time': 0.0,
+                'category': "Lyrics Mismatch",
+                'severity': "🟡 MEDIUM" if global_mismatch > 0.20 else "🔵 INFO",
+                'desc': f"Global Lyrical Phonetic Mismatch score calculated at {global_mismatch*100:.1f}%."
+            })
+        
+        for i in range(min_f):
+            if v_rms_a_frames[i] > 0.03:
+                dist = cdist(mfcc_a[:, [i]].T, mfcc_b[:, [i]].T, metric='cosine')[0, 0]
+                if dist > 0.20:
+                    anomalies.append({
+                        'time': i * 512 / TARGET_SR,
+                        'category': "Lyrical Phonetics",
+                        'severity': "🟡 MEDIUM",
+                        'desc': f"Pronunciation shift / word variation (vocal tract envelope mismatch of {dist*100:.1f}%)."
+                    })
+    except Exception as e:
+        print(f"⚠️ [Sweep] Lyric tracking warning: {e}")
+
+    anomalies = sorted(anomalies, key=lambda x: x['time'])
+    return anomalies
+
+
+# --- 10. TOPOLOGICAL VOCAL KNOT GENERATOR ---
+def generate_topological_vocal_knots(set_idx, inst_idx, clean_name, sources_a, sources_b, anomalies, timestamp):
+    """
+    Slices isolated vocal tracks into 5-second windows [T-2.5s, T+2.5s] centered
+    on each vocal or timing anomaly, reconstructing them as 3D delay-coordinate knots.
+    """
+    vocal_a = sources_a[1]  # Vocal Head
+    vocal_b = sources_b[1]  # Vocal Head
+    vocal_len = len(vocal_a)
+    
+    # Isolate relevant vocal or phonetic deviations
+    vocal_anomalies = [am for am in anomalies if am['time'] > 0.0 and am['category'] in ["Vocal Intonation", "Lyrical Phonetics"]]
+    
+    if not vocal_anomalies:
+        print(f"📍 [Knots] No vocal-specific inflection points located for Song Set {set_idx}.")
+        return []
+        
+    print(f"📍 [Knots] Constructing {len(vocal_anomalies)} vocal knots centered on key inflection points...")
+    
+    pdf_filename = f"set_{set_idx}_{clean_name}_vocal_knots_{timestamp}.pdf"
+    
+    tau = int(TARGET_SR * (TAU_MS / 1000.0))  # 10ms delay koordinat
+    span_samples = int(2.5 * TARGET_SR)      # 2.5 seconds half-width
+    ds = 15                                   # Downsample factor for clean lines
+    
+    knot_files = []
+    
+    with PdfPages(pdf_filename) as pdf:
+        for idx, am in enumerate(vocal_anomalies):
+            t_center = am['time']
+            sample_center = int(t_center * TARGET_SR)
+            
+            # Enforce strict boundary safety (no out-of-bounds indexing)
+            start_idx = max(0, sample_center - span_samples)
+            end_idx = min(vocal_len, sample_center + span_samples)
+            
+            # Extract corresponding 5-second slices
+            slice_a = vocal_a[start_idx:end_idx]
+            slice_b = vocal_b[start_idx:end_idx]
+            
+            if len(slice_a) < 3 * tau:
+                continue
+                
+            # Reconstruct 3D delay coordinates for Track A
+            x_a = slice_a[:-2*tau]
+            y_del_a = slice_a[tau:-tau]
+            z_del_a = slice_a[2*tau:]
+            
+            # Reconstruct 3D delay coordinates for Track B
+            x_b = slice_b[:-2*tau]
+            y_del_b = slice_b[tau:-tau]
+            z_del_b = slice_b[2*tau:]
+            
+            # Render Comparative 3D Phase Plot
+            fig = plt.figure(figsize=(10, 8))
+            ax = fig.add_subplot(111, projection='3d')
+            
+            ax.plot(x_a[::ds], y_del_a[::ds], z_del_a[::ds], label='Track A (Baseline)', color='#1f77b4', alpha=0.5, lw=1.2, rasterized=True)
+            ax.plot(b.audio[:-2*tau][::ds] if 'b' in locals() else x_b[::ds], 
+                    b.audio[tau:-tau][::ds] if 'b' in locals() else y_del_b[::ds], 
+                    b.audio[2*tau:][::ds] if 'b' in locals() else z_del_b[::ds], 
+                    label='Track B (Instance)', color='#ff7f0e', alpha=0.6, lw=1.2, rasterized=True)
+            
+            ax.set_title(f"Vocal Knot at {t_center:.2f}s (Set {set_idx})\nAnomaly: {am['desc']}", fontsize=11, fontweight='bold', pad=10)
+            ax.set_xticklabels([]); ax.set_yticklabels([]); ax.set_zticklabels([])
+            ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0)); ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0)); ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+            ax.set_box_aspect([1, 1, 1])
+            ax.view_init(elev=20, azim=45)
+            ax.legend(loc='upper right', frameon=True, fontsize=9)
+            
+            pdf.savefig(fig, dpi=300)
+            plt.close(fig)
+            
+    print(f"💾 [Knots] Compiled multi-page vocal knot report to '{pdf_filename}'")
+    return [pdf_filename]
+
+
+# --- 11. VISUAL DASHBOARD GENERATOR ---
+def draw_detailed_discrepancy_pdf(set_idx, inst_idx, clean_name, agents_a, agents_b, discrepancies, anomalies, output_filename, b_start, i_start):
+    fig1 = plt.figure(figsize=(20, 11))
+    fig1.suptitle(f"APEX Topological Comparison Dashboard (Song Set {set_idx} | {clean_name})", fontsize=16, fontweight='bold', y=0.96)
+    
+    gs = GridSpec(NUM_HEADS, 4, width_ratios=[1.0, 1.0, 1.0, 1.25])
+    gs.update(left=0.08, right=0.94, top=0.88, bottom=0.07, wspace=0.18, hspace=0.35)
+    
+    ds = 20 
+    colors = ['#1f77b4', '#2ca02c', '#9467bd']
+    
+    for k in range(NUM_HEADS):
+        a, b = agents_a[k], agents_b[k]
+        
+        # Column 1: Track A Attractor
+        ax_a = fig1.add_subplot(gs[k, 0], projection='3d')
+        ax_a.plot(a.x[::ds], a.y_del[::ds], a.z_del[::ds], color='#1f77b4', alpha=0.6, lw=1.0, rasterized=True)
+        ax_a.set_title(f"Track A Attractor (Baseline)", fontsize=9, style='italic')
+        ax_a.set_xticklabels([]); ax_a.set_yticklabels([]); ax_a.set_zticklabels([])
+        ax_a.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0)); ax_a.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0)); ax_a.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+        ax_a.set_box_aspect([1, 1, 1]); ax_a.view_init(elev=22, azim=40)
+        ax_a.text2D(-0.1, 0.5, f"Head #{k}\n{a.source_name}", transform=ax_a.transAxes, 
+                  fontsize=11, fontweight='bold', va='center', ha='right', color='#333333')
+
+        # Column 2: Track B Attractor
+        ax_b = fig1.add_subplot(gs[k, 1], projection='3d')
+        ax_b.plot(b.x[::ds], b.y_del[::ds], b.z_del[::ds], color='#ff7f0e', alpha=0.6, lw=1.0, rasterized=True)
+        ax_b.set_title(f"Track B Attractor", fontsize=9, style='italic')
+        ax_b.set_xticklabels([]); ax_b.set_yticklabels([]); ax_b.set_zticklabels([])
+        ax_b.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0)); ax_b.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0)); ax_b.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+        ax_b.set_box_aspect([1, 1, 1]); ax_b.view_init(elev=22, azim=40)
+
+        # Column 3: Overlaid Attractors
+        ax_3d = fig1.add_subplot(gs[k, 2], projection='3d')
+        ax_3d.plot(a.x[::ds], a.y_del[::ds], a.z_del[::ds], label='Track A', color='#1f77b4', alpha=0.5, lw=1.0, rasterized=True)
+        ax_3d.plot(b.x[::ds], b.y_del[::ds], b.z_del[::ds], label='Track B', color='#ff7f0e', alpha=0.5, lw=1.0, rasterized=True)
+        ax_3d.set_title(f"Overlaid Attractors", fontsize=10, fontweight='bold')
+        ax_3d.set_xticklabels([]); ax_3d.set_yticklabels([]); ax_3d.set_zticklabels([])
+        ax_3d.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0)); ax_3d.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0)); ax_3d.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+        ax_3d.set_box_aspect([1, 1, 1]); ax_3d.view_init(elev=22, azim=40)
+        if k == 0:
+            ax_3d.legend(loc='upper right', bbox_to_anchor=(0.95, 0.95), frameon=True, fontsize=8)
+            
+        # Column 4: Discrepancy Timeline
+        ax_diff = fig1.add_subplot(gs[k, 3])
+        diff_sig = discrepancies[k]['smoothed_diff']
+        timeline = np.arange(len(diff_sig)) / TARGET_SR
+        
+        ax_diff.plot(timeline, diff_sig, color=colors[k], lw=1.5)
+        max_time = discrepancies[k]['max_time']
+        max_val = discrepancies[k]['max_diff']
+        ax_diff.axvline(max_time, color='red', linestyle='--', alpha=0.6)
+        ax_diff.plot(max_time, max_val, 'ro')
+        ax_diff.text(max_time + 1.5, max_val * 0.82, f"Peak Delta: {max_val:.4f} at {max_time:.2f}s", fontsize=8)
+        
+        ax_diff.set_title(f"Discrepancy Timeline (Mean: {discrepancies[k]['mean_diff']:.4f})", fontsize=10, fontweight='bold')
+        ax_diff.set_ylabel("Delta Distance")
+        ax_diff.grid(True, linestyle=':', alpha=0.6)
+        if k == NUM_HEADS - 1:
+            ax_diff.set_xlabel("Time (Seconds)")
+            
+    with PdfPages(output_filename) as pdf:
+        pdf.savefig(fig1, dpi=300)
+        plt.close(fig1)
+        
+        fig2 = plt.figure(figsize=(20, 11))
+        ax_text = fig2.add_subplot(111)
+        ax_text.axis('off')
+        
+        ref_duration = len(agents_a[0].audio) / TARGET_SR
+        inst_duration = len(agents_b[0].audio) / TARGET_SR
+        
+        report_lines = [
+            f"=======================================================================================================",
+            f"                             🔍 DETAILED FORENSIC DISCREPANCY REPORT CARD",
+            f"=======================================================================================================",
+            f" SONG SET: {clean_name.upper()}  |  PAIRWISE RELATIONSHIP: REFERENCE vs INSTANCE {inst_idx}",
+            f" REFERENCE ALIGNMENT WINDOW: {b_start:.2f}s to {(b_start + ref_duration):.2f}s",
+            f" INSTANCE ALIGNMENT WINDOW  : {i_start:.2f}s to {(i_start + inst_duration):.2f}s",
+            f"-------------------------------------------------------------------------------------------------------",
+            f"{'TIMESTAMP (REL)':<20} | {'TIMESTAMP (REF MASTER)':<22} | {'TIMESTAMP (INST MASTER)':<24} | {'SEVERITY':<12} | {'ANOMALY CATEGORY':<20} | {'DESCRIPTION':<50}",
+            f"-------------------------------------------------------------------------------------------------------"
+        ]
+        
+        printed_count = 0
+        last_printed_time = -999.0
+        
+        for am in anomalies:
+            if printed_count >= 14:
+                break
+            if am['time'] - last_printed_time < 1.5 and am['time'] != 0.0:
+                continue
+                
+            rel_t = am['time']
+            master_a_t = b_start + rel_t if rel_t != 0.0 else 0.0
+            master_b_t = i_start + rel_t if rel_t != 0.0 else 0.0
+            
+            time_str = f"{rel_t:.2f}s" if rel_t != 0.0 else "N/A (Global)"
+            ref_str = f"{master_a_t:.2f}s" if rel_t != 0.0 else "N/A"
+            inst_str = f"{master_b_t:.2f}s" if rel_t != 0.0 else "N/A"
+            
+            line = f"{time_str:<20} | {ref_str:<22} | {inst_str:<24} | {am['severity']:<12} | {am['category']:<20} | {am['desc'][:50]}"
+            report_lines.append(line)
+            
+            last_printed_time = rel_t
+            printed_count += 1
+            
+        if printed_count == 0:
+            report_lines.append("  [✓] No significant anomalous deviations detected across this alignment window.")
+            
+        report_lines.append(f"-------------------------------------------------------------------------------------------------------")
+        report_lines.append(f" REPORT GENERATION TIMESTAMP: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        report_lines.append(f"=======================================================================================================")
+        
+        text_content = "\n".join(report_lines)
+        ax_text.text(0.02, 0.95, text_content, fontsize=10, fontfamily='monospace', va='top', ha='left', color='#111111')
+        
+        pdf.savefig(fig2, dpi=300)
+        plt.close(fig2)
+
+
+# --- 12. N-WAY COUPLING COORDINATOR ENGINE ---
+def run_nway_topological_pipeline(file_paths):
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    print(f"\n🚀 [System] Initializing N-Way Pipeline on {len(file_paths)} Long-Form files...")
+    
+    waveforms = []
+    file_names = []
+    for path in file_paths:
+        y, _ = librosa.load(path, sr=TARGET_SR)
+        waveforms.append(y)
+        file_names.append(os.path.basename(path))
+        
+    num_files = len(file_paths)
+    raw_matches = []
+    hop = 4096
+    
+    print("⏳ [MIR Engine] Conducting searches...")
+    for i in range(num_files):
+        for j in range(i, num_files):
+            is_self = (i == j)
+            matches_ij, hop = search_longform_repeats(
+                waveforms[i], waveforms[j], TARGET_SR, is_self=is_self
+            )
+            for m in matches_ij:
+                start_sec_1 = (m['f1_start'] * hop) / TARGET_SR
+                end_sec_1 = (m['f1_end'] * hop) / TARGET_SR
+                start_sec_2 = (m['f2_start'] * hop) / TARGET_SR
+                end_sec_2 = (m['f2_end'] * hop) / TARGET_SR
+                
+                y_slice_1 = waveforms[i][int(start_sec_1 * TARGET_SR):int(end_sec_1 * TARGET_SR)]
+                y_slice_2 = waveforms[j][int(start_sec_2 * TARGET_SR):int(end_sec_2 * TARGET_SR)]
+                
+                if verify_segment_similarity(y_slice_1, y_slice_2):
+                    raw_matches.append((
+                        i, m['f1_start'], m['f1_end'], 
+                        j, m['f2_start'], m['f2_end'], 
+                        m['mean_dist']
+                    ))
+                
+    song_sets = cluster_and_group_segments(raw_matches, hop, TARGET_SR)
+    
+    if not song_sets:
+        print("❌ [MIR Engine] No matching repeating song components found across files.")
+        return
+        
+    print(f"🎯 [MIR Engine] Resolved {len(song_sets)} unique verified Song Sets.")
+    
+    text_report_path = f"discrepancy_report_{timestamp}.txt"
+    with open(text_report_path, "w", encoding="utf-8") as log:
+        log.write("=================================================================================\n")
+        log.write(" 📟 APEX N-WAY MULTI-REPEAT ANALYSIS DISCREPANCY REPORT\n")
+        log.write("=================================================================================\n")
+        log.write(f"Execution Run Timestamp: {timestamp}\n")
+        log.write("Source Files Evaluated:\n")
+        for idx, fn in enumerate(file_names):
+            log.write(f"  • File {idx}: {fn}\n")
+        log.write(f"Total Song Sets Identified: {len(song_sets)}\n\n")
+
+    for set_idx, group in enumerate(song_sets):
+        baseline_meta = group[0]
+        b_file_idx = baseline_meta['file_idx']
+        b_start_sec = (baseline_meta['start'] * hop) / TARGET_SR
+        b_end_sec = (baseline_meta['end'] * hop) / TARGET_SR
+        
+        y_baseline_slice = waveforms[b_file_idx][int(b_start_sec*TARGET_SR) : int(b_end_sec*TARGET_SR)]
+        ref_duration_samples = len(y_baseline_slice)
+        
+        fn_baseline = f"set_{set_idx}_instance_0_ref_{timestamp}.wav"
+        scaled_base = np.clip(y_baseline_slice, -1.0, 1.0) * 32767.0
+        wav_write(fn_baseline, TARGET_SR, scaled_base.astype(np.int16))
+        
+        dummy_align, _, _, _ = align_track_slices(y_baseline_slice, y_baseline_slice)
+        _, _, head_names = process_projective_nmf(dummy_align, dummy_align, k=NUM_HEADS)
+        
+        clean_song_name = head_names[1].replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "")
+        
+        print(f"\n=================================================================================")
+        print(f" 📦 PROCESSING SONG SET {set_idx+1} / {len(song_sets)} ({clean_song_name})")
+        print(f"=================================================================================")
+
+        with open(text_report_path, "a", encoding="utf-8") as log:
+            log.write(f"---------------------------------------------------------------------------------\n")
+            log.write(f" 📦 SONG SET #{set_idx}: {clean_song_name} ({len(group)} instances)\n")
+            log.write(f"---------------------------------------------------------------------------------\n")
+            log.write(f" ⭐ Baseline Reference (Instance 0):\n")
+            log.write(f"    - Located in : File {b_file_idx} ({file_names[b_file_idx]})\n")
+            log.write(f"    - Timeline   : {b_start_sec:.2f}s to {b_end_sec:.2f}s\n")
+            log.write(f"    - Output File: {fn_baseline}\n\n")
+            
+        for inst_idx, inst_meta in enumerate(group[1:], start=1):
+            i_file_idx = inst_meta['file_idx']
+            i_start_sec = (inst_meta['start'] * hop) / TARGET_SR
+            
+            i_start_frame = int(i_start_sec * TARGET_SR)
+            y_inst_slice = waveforms[i_file_idx][i_start_frame : i_start_frame + ref_duration_samples]
+            
+            if len(y_inst_slice) < ref_duration_samples:
+                pad_len = ref_duration_samples - len(y_inst_slice)
+                y_inst_slice = np.pad(y_inst_slice, (0, pad_len))
+            
+            fn_inst = f"set_{set_idx}_instance_{inst_idx}_{timestamp}.wav"
+            scaled_inst = np.clip(y_inst_slice, -1.0, 1.0) * 32767.0
+            wav_write(fn_inst, TARGET_SR, scaled_inst.astype(np.int16))
+            
+            print(f" 🔍 Comparing Baseline (Instance 0) vs Instance {inst_idx}...")
+            
+            y_aligned_a, y_aligned_b, wp, dtw_hop = align_track_slices(y_baseline_slice, y_inst_slice)
+            sources_a, sources_b, head_names = process_projective_nmf(y_aligned_a, y_aligned_b, k=NUM_HEADS)
+            
+            print("🧠 [Semantic Engine] Running analysis sweep...")
+            anomalies = perform_deep_discrepancy_sweep(
+                y_baseline_slice, y_inst_slice, wp, dtw_hop, head_names, sources_a, sources_b, b_start_sec, i_start_sec
+            )
+            
+            # ---------------------------------------------------------------------------
+            # TOPOLOGICAL VOCAL KNOT PROCESSING STEP
+            # ---------------------------------------------------------------------------
+            generate_topological_vocal_knots(set_idx, inst_idx, clean_song_name, sources_a, sources_b, anomalies, timestamp)
+            
+            agents_a = [MultiHeadAgent(i, "Baseline", sources_a[i], TARGET_SR, head_names[i]) for i in range(NUM_HEADS)]
+            agents_b = [MultiHeadAgent(i, f"Inst {inst_idx}", sources_b[i], TARGET_SR, head_names[i]) for i in range(NUM_HEADS)]
+            
+            discrepancies = {}
+            for k in range(NUM_HEADS):
+                a_head, b_head = agents_a[k], agents_b[k]
+                diff = np.sqrt((a_head.x - b_head.x)**2 + (a_head.y_del - b_head.y_del)**2 + (a_head.z_del - b_head.z_del)**2)
+                smoothed_diff = uniform_filter1d(diff, size=int(TARGET_SR * 0.15))
+                max_idx = np.argmax(smoothed_diff)
+                
+                discrepancies[k] = {
+                    'smoothed_diff': smoothed_diff,
+                    'mean_diff': np.mean(smoothed_diff),
+                    'max_diff': np.max(smoothed_diff),
+                    'max_time': max_idx / TARGET_SR
+                }
+                
+            pdf_fn = f"set_{set_idx}_{clean_song_name}_vs_inst_{inst_idx}_{timestamp}.pdf"
+            
+            draw_detailed_discrepancy_pdf(
+                set_idx, inst_idx, clean_song_name, agents_a, agents_b, discrepancies, 
+                anomalies, pdf_fn, b_start_sec, i_start_sec
+            )
+            
+            with open(text_report_path, "a", encoding="utf-8") as log:
+                log.write(f" 🔸 Comparison: Reference vs Instance {inst_idx}\n")
+                log.write(f"    - Instance Location: File {i_file_idx} ({file_names[i_file_idx]})\n")
+                log.write(f"    - Instance Timeline: {i_start_sec:.2f}s to {(i_start_sec + (ref_duration_samples/TARGET_SR)):.2f}s\n")
+                log.write(f"    - Output WAV Segment: {fn_inst}\n")
+                log.write(f"    - Dashboard PDF     : {pdf_fn}\n\n")
+                
+                log.write("====== 🧠 APEX SEMANTIC MACRO INTERPRETATION ======\n")
+                for am in anomalies:
+                    rel_t = am['time']
+                    master_a_t = b_start_sec + rel_t if rel_t != 0.0 else 0.0
+                    master_b_t = i_start_sec + rel_t if rel_t != 0.0 else 0.0
+                    
+                    time_lbl = f"At local {rel_t:.2f}s (Ref: {master_a_t:.2f}s, Inst: {master_b_t:.2f}s)" if rel_t != 0.0 else "Global Parameter Mismatch"
+                    log.write(f" [{am['severity']}] {am['category']} -> {time_lbl}\n")
+                    log.write(f"   ↳ {am['desc']}\n\n")
+                log.write("===================================================\n\n")
+                
+                for k in range(NUM_HEADS):
+                    name = head_names[k]
+                    stats = discrepancies[k]
+                    rel_sec = stats['max_time']
+                    
+                    master_ref_peak_sec = b_start_sec + rel_sec
+                    master_inst_peak_sec = i_start_sec + rel_sec
+                    
+                    log.write(f"     🔹 HEAD #{k}: {name}\n")
+                    log.write(f"       - Mean Discrepancy : {stats['mean_diff']:.4f}\n")
+                    log.write(f"       - Peak Discrepancy : {stats['max_diff']:.4f}\n")
+                    log.write(f"       - Peak Time (Relative)    : {rel_sec:.2f} seconds\n")
+                    log.write(f"       - Peak Time (Reference A) : {master_ref_peak_sec:.2f} seconds\n")
+                    log.write(f"       - Peak Time (Instance B)  : {master_inst_peak_sec:.2f} seconds\n\n")
+                log.write("\n")
+                
+    print(f"\n💾 [Done] N-Way comparison run complete.")
+    print(f"   - Slices and PDF Reports successfully compiled.")
+    print(f"   - Summaries saved to: {os.path.abspath(text_report_path)}")
+
+
+# --- 13. DEMO MIXTAPE GENERATOR ---
+def generate_demo_files():
+    print("⚠️ [Setup] Generating 3 separate mixtapes to simulate multiple repeats...")
+    t_segment = np.arange(int(TARGET_SR * 22)) / TARGET_SR 
+    
+    bass = 0.5 * np.sin(2 * np.pi * 55 * t_segment)
+    keys = 0.4 * np.sin(2 * np.pi * 330 * t_segment)
+    vocal = 0.3 * np.sin(2 * np.pi * (880 * t_segment + 3.0 * np.sin(2 * np.pi * 1.0 * t_segment)))
+    song_a = bass + keys + vocal
+    
+    bass_dr = 0.5 * np.sin(2 * np.pi * 55.2 * t_segment)
+    keys_dr = 0.4 * np.sin(2 * np.pi * 330 * t_segment)
+    vocal_dr = 0.3 * np.sin(2 * np.pi * (885 * t_segment + 3.0 * np.sin(2 * np.pi * 1.05 * t_segment)))
+    song_b = bass_dr + keys_dr + vocal_dr
+    
+    bass_mod = 0.5 * np.sin(2 * np.pi * 55.4 * t_segment)
+    keys_mod = 0.4 * np.sin(2 * np.pi * 330 * t_segment)
+    vocal_mod = 0.3 * np.sin(2 * np.pi * (878 * t_segment + 3.0 * np.sin(2 * np.pi * 0.98 * t_segment)))
+    song_c = bass_mod + keys_mod + vocal_mod
+    
+    mixtape_1 = np.zeros(int(TARGET_SR * 30))
+    mixtape_1[int(TARGET_SR * 3) : int(TARGET_SR * 3) + len(song_a)] = song_a
+    
+    mixtape_2 = np.zeros(int(TARGET_SR * 30))
+    mixtape_2[int(TARGET_SR * 6) : int(TARGET_SR * 6) + len(song_b)] = song_b
+    
+    mixtape_3 = np.zeros(int(TARGET_SR * 30))
+    mixtape_3[int(TARGET_SR * 1) : int(TARGET_SR * 1) + len(song_c)] = song_c
+    
+    for name, data in [("nway_mixtape_1.wav", mixtape_1), ("nway_mixtape_2.wav", mixtape_2), ("nway_mixtape_3.wav", mixtape_3)]:
+        scaled = np.clip(data, -1.0, 1.0) * 32767.0
+        wav_write(name, TARGET_SR, scaled.astype(np.int16))
+        
+    return ["nway_mixtape_1.wav", "nway_mixtape_2.wav", "nway_mixtape_3.wav"]
+
+
+# --- 14. MAIN ENTRY POINT ---
+if __name__ == "__main__":
+    import tkinter as tk
+    from tkinter import filedialog
+    
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    
+    print("📂 Please select multiple long-form audio files (or cancel to run the baseline multi-repeat demo)...")
+    paths = filedialog.askopenfilenames(
+        title="Select Multiple Long-Form Audio Files (Mixtapes)", 
+        filetypes=[("Audio Files", "*.wav *.mp3 *.flac")]
+    )
+    
+    if not paths:
+        print("❌ File selection cancelled. Falling back to 3-file demo pipeline...")
+        paths = generate_demo_files()
+        
+    run_nway_topological_pipeline(list(paths))
