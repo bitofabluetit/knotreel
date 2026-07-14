@@ -1,0 +1,255 @@
+import os
+import numpy as np
+import scipy.signal
+import librosa
+import soundfile as sf
+
+# --- CONFIGURATION ---  PUT FILE NAMES/PATH HERE
+FILE1_PATH = "audio_a.wav"        # One of your two files
+FILE2_PATH = "audio_b.wav"        # The other file
+NUM_REPEATED_SONGS = 12         # We want to extract exactly the 12 repeated songs
+SAMPLE_RATE = 22050             # 22050 Hz is ideal for quick & accurate matching. Set to 44100 for maximum fidelity.
+HOP_LENGTH = 512
+
+# Silence & Segmentation parameters
+SILENCE_THRESHOLD_DB = 30       # Threshold in dB below peak to identify silence
+MERGE_GAP_SEC = 4.0             # Merge silent pauses shorter than this to prevent splitting a single song
+MIN_SONG_LEN_SEC = 45.0         # Ignore any segments shorter than 45 seconds (noise, static, etc.)
+MIN_PEAK_DIST_SEC = 60.0        # Minimum spacing between the two instances of the same song in the long file
+
+
+def load_audio_stereo_and_mono(file_path, sr):
+    print(f"Loading '{file_path}'...")
+    # Load as stereo (mono=False) to preserve the original audio fidelity
+    y_stereo, _ = librosa.load(file_path, sr=sr, mono=False)
+    
+    # Generate a mono downmix for faster, reliable signal processing
+    if y_stereo.ndim > 1:
+        y_mono = librosa.to_mono(y_stereo)
+    else:
+        y_mono = y_stereo
+        
+    return y_stereo, y_mono
+
+
+def merge_intervals(intervals, min_gap_samples):
+    """Merges adjacent non-silent segments if their separation is very short."""
+    if len(intervals) == 0:
+        return []
+    merged = []
+    current_start, current_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start - current_end < min_gap_samples:
+            current_end = end  # Merge them
+        else:
+            merged.append((current_start, current_end))
+            current_start = start
+            current_end = end
+    merged.append((current_start, current_end))
+    return merged
+
+
+def fine_tune_and_score(y_cand, y_long, coarse_offset, sr, search_window_sec=2.0):
+    """Aligns a match down to the sample and returns its Pearson correlation score."""
+    chunk_sec = 10.0
+    if len(y_cand) < int(chunk_sec * sr):
+        ref_chunk = y_cand
+        start_ref = 0
+    else:
+        start_ref = len(y_cand) // 2 - int(chunk_sec * sr) // 2
+        ref_chunk = y_cand[start_ref : start_ref + int(chunk_sec * sr)]
+        
+    # Define search boundaries in the longer track around the coarse offset
+    search_start = max(0, coarse_offset + start_ref - int(search_window_sec * sr))
+    search_end = min(len(y_long), coarse_offset + start_ref + len(ref_chunk) + int(search_window_sec * sr))
+    target_chunk = y_long[search_start:search_end]
+    
+    if len(target_chunk) < len(ref_chunk):
+        return coarse_offset, 0.0
+        
+    # Sample-level raw waveform correlation
+    corr = scipy.signal.correlate(target_chunk, ref_chunk, mode='valid')
+    best_idx = np.argmax(corr)
+    
+    fine_offset = (search_start + best_idx) - start_ref
+    
+    # Extract aligned window to compute Pearson correlation coefficient (NCC)
+    aligned_target = y_long[fine_offset : fine_offset + len(y_cand)]
+    if len(aligned_target) < len(y_cand):
+        aligned_target = np.pad(aligned_target, (0, len(y_cand) - len(aligned_target)), mode='constant')
+        
+    # Compute score on a 15-second sub-window from the center to save memory/CPU
+    win_size = int(15.0 * sr)
+    if len(y_cand) > win_size:
+        idx_start = len(y_cand) // 2 - win_size // 2
+        x = y_cand[idx_start : idx_start + win_size]
+        y = aligned_target[idx_start : idx_start + win_size]
+    else:
+        x = y_cand
+        y = aligned_target
+        
+    std_x, std_y = np.std(x), np.std(y)
+    if std_x < 1e-6 or std_y < 1e-6:
+        score = 0.0
+    else:
+        score = np.mean((x - np.mean(x)) * (y - np.mean(y))) / (std_x * std_y + 1e-8)
+        
+    return fine_offset, max(0.0, float(score))
+
+
+def extract_segment_stereo(y, start_sample, duration_samples):
+    """Extracts a segment from mono or stereo arrays and pads with silence if out of bounds."""
+    is_stereo = y.ndim > 1
+    end_sample = start_sample + duration_samples
+    
+    slice_start = max(0, start_sample)
+    slice_end = min(y.shape[-1] if is_stereo else len(y), end_sample)
+    
+    if is_stereo:
+        segment = y[:, slice_start:slice_end]
+    else:
+        segment = y[slice_start:slice_end]
+        
+    pad_left = max(0, -start_sample)
+    seg_len = segment.shape[-1] if is_stereo else len(segment)
+    pad_right = max(0, duration_samples - seg_len - pad_left)
+    
+    if pad_left > 0 or pad_right > 0:
+        if is_stereo:
+            segment = np.pad(segment, ((0, 0), (pad_left, pad_right)), mode='constant')
+        else:
+            segment = np.pad(segment, (pad_left, pad_right), mode='constant')
+            
+    return segment
+
+
+def main():
+    if not os.path.exists(FILE1_PATH) or not os.path.exists(FILE2_PATH):
+        print(f"Error: Make sure both '{FILE1_PATH}' and '{FILE2_PATH}' exist in the directory.")
+        return
+        
+    # Load stereo for exporting, and mono for matching
+    y1_stereo, y1_mono = load_audio_stereo_and_mono(FILE1_PATH, SAMPLE_RATE)
+    y2_stereo, y2_mono = load_audio_stereo_and_mono(FILE2_PATH, SAMPLE_RATE)
+    
+    # Identify reference (shorter, 1 playlist instance) vs search target (longer, 2 instances)
+    if len(y1_mono) < len(y2_mono):
+        y_short_stereo, y_short_mono = y1_stereo, y1_mono
+        y_long_stereo, y_long_mono = y2_stereo, y2_mono
+        short_name, long_name = FILE1_PATH, FILE2_PATH
+    else:
+        y_short_stereo, y_short_mono = y2_stereo, y2_mono
+        y_long_stereo, y_long_mono = y1_stereo, y1_mono
+        short_name, long_name = FILE2_PATH, FILE1_PATH
+        
+    print(f"\nTemplate source: {short_name} ({len(y_short_mono)/SAMPLE_RATE/60:.1f} minutes)")
+    print(f"Search source  : {long_name} ({len(y_long_mono)/SAMPLE_RATE/60:.1f} minutes)")
+    
+    # 1. Segment the shorter file into candidate tracks
+    print("\nSegmenting the shorter file into candidate songs...")
+    raw_intervals = librosa.effects.split(y_short_mono, top_db=SILENCE_THRESHOLD_DB)
+    min_gap_samples = int(MERGE_GAP_SEC * SAMPLE_RATE)
+    merged_intervals = merge_intervals(raw_intervals, min_gap_samples)
+    
+    candidates = []
+    for start, end in merged_intervals:
+        duration_sec = (end - start) / SAMPLE_RATE
+        if duration_sec >= MIN_SONG_LEN_SEC:
+            candidates.append((start, end))
+            
+    print(f"Found {len(candidates)} candidate audio tracks (filtering out short noise/gaps).")
+    
+    # 2. Compute RMS envelope of the target file once
+    print("Pre-computing volume envelope for search source...")
+    rms_long = librosa.feature.rms(y=y_long_mono, hop_length=HOP_LENGTH)[0]
+    rms_long_norm = (rms_long - np.mean(rms_long)) / (np.std(rms_long) + 1e-8)
+    
+    match_results = []
+    
+    # 3. Search and score each candidate
+    print("\nMatching candidate songs. This will take a moment...")
+    min_dist_frames = int(MIN_PEAK_DIST_SEC * SAMPLE_RATE / HOP_LENGTH)
+    
+    for idx, (start, end) in enumerate(candidates):
+        y_cand = y_short_mono[start:end]
+        rms_cand = librosa.feature.rms(y=y_cand, hop_length=HOP_LENGTH)[0]
+        rms_cand_norm = (rms_cand - np.mean(rms_cand)) / (np.std(rms_cand) + 1e-8)
+        
+        # Coarse cross-correlation
+        corr = scipy.signal.correlate(rms_long_norm, rms_cand_norm, mode='valid')
+        
+        # Locate the two highest peak matches separated by minimum distance
+        peaks, _ = scipy.signal.find_peaks(corr, distance=min_dist_frames)
+        if len(peaks) < 2:
+            sorted_indices = np.argsort(corr)[::-1]
+            best_peaks = []
+            for p_idx in sorted_indices:
+                if all(abs(p_idx - p) > min_dist_frames for p in best_peaks):
+                    best_peaks.append(p_idx)
+                if len(best_peaks) == 2:
+                    break
+            peaks = np.array(best_peaks)
+        else:
+            peak_values = corr[peaks]
+            top_indices = np.argsort(peak_values)[-2:]
+            peaks = peaks[top_indices]
+            
+        # Refine offsets and get correlation scores
+        fine_offsets = []
+        scores = []
+        for peak in sorted(peaks):
+            coarse_offset = peak * HOP_LENGTH
+            fine_offset, score = fine_tune_and_score(y_cand, y_long_mono, coarse_offset, SAMPLE_RATE)
+            fine_offsets.append(fine_offset)
+            scores.append(score)
+            
+        # Overall match confidence is the average score of the two matches
+        mean_score = np.mean(scores)
+        match_results.append({
+            "start": start,
+            "end": end,
+            "score": mean_score,
+            "offsets": fine_offsets,
+            "original_index": idx
+        })
+        print(f"  Candidate {idx+1:02d}: Time {start/SAMPLE_RATE/60:5.2f}m | Match Confidence: {mean_score:.2f}")
+        
+    # 4. Filter and select the top 12 repeated tracks
+    # We sort by match score to separate the repeated tracks from the "random" unrepeated ones.
+    match_results.sort(key=lambda x: x["score"], reverse=True)
+    top_selections = match_results[:NUM_REPEATED_SONGS]
+    
+    # Sort the top 12 chronologically so they are outputted as song_01 to song_12 in track order
+    top_selections.sort(key=lambda x: x["start"])
+    
+    print("\n--- SELECTION SUMMARY ---")
+    print(f"Selected the top {NUM_REPEATED_SONGS} repeating tracks based on double-match confidence:")
+    for rank, item in enumerate(top_selections):
+        print(f"  Track {rank+1:02d} (Original Cand {item['original_index']+1:02d}): "
+              f"Start {item['start']/SAMPLE_RATE/60:5.2f}m | Confidence: {item['score']:.2f}")
+        
+    # 5. Extract, Mix and Save
+    print("\nExporting synced and overlaid tracks...")
+    for rank, item in enumerate(top_selections):
+        duration_samples = item["end"] - item["start"]
+        
+        # Slice original stereo signals using aligned sample boundaries
+        rec1 = extract_segment_stereo(y_short_stereo, item["start"], duration_samples)
+        rec2 = extract_segment_stereo(y_long_stereo, item["offsets"][0], duration_samples)
+        rec3 = extract_segment_stereo(y_long_stereo, item["offsets"][1], duration_samples)
+        
+        # Mix the three instances (preventing clipping by averaging)
+        mixed = (rec1 + rec2 + rec3) / 3.0
+        
+        output_filename = f"song_{rank+1:02d}_synced.wav"
+        
+        # soundfile expects stereo arrays as (samples, channels)
+        write_data = mixed.T if mixed.ndim > 1 else mixed
+        sf.write(output_filename, write_data, SAMPLE_RATE)
+        print(f"  Saved: '{output_filename}' (Duration: {duration_samples/SAMPLE_RATE:.1f}s)")
+        
+    print("\nProcess finished. The 12 repeating songs have been extracted and overlaid.")
+
+
+if __name__ == "__main__":
+    main()
